@@ -1,0 +1,49 @@
+# Python cache»¶
+__pycache__/
+*.py[cod]
+*.pyo
+
+# environment
+venv/
+env/
+.venv/
+.env/
+
+# log, tmp»¶
+*.log
+*.tmp
+*.swp
+*.txt
+
+# data, record
+*.csv
+*.npy
+*.npz
+*.pth
+*.h5
+*.pt
+
+# Jupyter Notebook ¹
+.ipynb_checkpoints/
+
+# VSCode, PyCharm, IDE½®
+.vscode/
+.idea/
+
+# OSé¡¹
+.DS_Store
+Thumbs.db
+
+# output
+checkpoints/
+runs/               
+output/
+results/
+
+# environment setting
+.env
+
+# pip requirements lock
+poetry.lock
+Pipfile.lock
+
