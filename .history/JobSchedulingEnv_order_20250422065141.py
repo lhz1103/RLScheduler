@@ -20,8 +20,12 @@ class JobSchedulingEnv():
             cloud_cost_weight: 云成本的权重系数
         """
         super().__init__()
-        # 动作空间定义 (0~N-1: 服务器, N: 云, N+1: 等待)
-        self.action_space = spaces.Discrete(num_nodes + 2)
+        # 动作空间定义 (一个优先级分数，用于排序任务)
+        self.action_space = spaces.Box(
+            low=0, high=1, 
+            shape=(max_jobs_per_ts,),  # 每个任务一个优先级分数
+            dtype=np.float32
+        )
 
         self.max_jobs_per_ts = max_jobs_per_ts  # 每个时隙最大的调度任务数量（包括新到来的和队列中等待的）
         
@@ -113,13 +117,69 @@ class JobSchedulingEnv():
         # 加载初始任务到队列
         self._load_jobs()
         return self._get_observation()
+        
+    def allocate_one_job(self, job:Job):
+        # 尝试在集群中分配资源
+        required_gpus = job.num_gpus
+        job.deadline = job.runtime * job.num_gpus * 1
+        allocated = False
+        
+        # 集群中有足够资源时
+        if sum(self.cluster_state) >= required_gpus:
+            # 策略1: 优先寻找能一次性分配的单节点
+            for node_id in range(self.num_nodes):
+                if self.cluster_state[node_id] >= required_gpus:
+                    self.cluster_state[node_id] -= required_gpus
+                    job.assigned_gpus[node_id] = required_gpus
+                    self._start_job_execution(job)
+                    allocated = True
+                    break
+            # 策略2: 跨节点分配
+            if not allocated and required_gpus <= sum(self.cluster_state):
+            # 跨节点分配逻辑（需计算实际运行时间）
+                used_nodes = []
+            for node_id in range(self.num_nodes):
+                alloc = min(self.cluster_state[node_id], required_gpus - sum(job.assigned_gpus))
+                if alloc > 0:
+                    self.cluster_state[node_id] -= alloc
+                    job.assigned_gpus[node_id] += alloc
+                    allocated_gpus += alloc
+                    used_nodes.append(node_id)
+                elif allocated_gpus >= required_gpus:
+                    self._start_job_execution(job)
+                    allocated = True
+                    break   
+        # 集群没有足够资源时 
+        else:
+            if job.deadline > 0:
+                # 策略3: 等待
+                self.wait_jobs.append(job)
+                job.deadline -= 20 / 60
+                self.visible_jobs.remove(job)
+                # 区分是资源不足导致的等待（给小惩罚）还是有资源时主动等待（给一个大的惩罚）
+                if all(x == 0 for x in self.cluster_state) or (sum(self.cluster_state) < required_gpus): # 如果是资源不足导致任务等待，给一个小惩罚
+                    self.reward -= 5
+                else:
+                    self.reward -= 500
+            # 策略4: 若无法在集群分配且允许上云
+            elif not allocated and not job.privacy and job.deadline <= 0:
+                cloud_cost = job.cost
+                self.cloud_cost.append(cloud_cost)
+                self.total_cloud_cost += cloud_cost
+                job.start = self.current_time
+                job.state = 'CLOUD'
+                self.reward -= self.cloud_cost_weight * cloud_cost
+                self.finished_jobs.append(job)
+                self.visible_jobs.remove(job)
+                allocated = True
 
-    def step(self, action: int) -> tuple[Dict[str, np.ndarray], float, bool, dict]: 
+
+    def step(self, action: np.ndarray) -> tuple[Dict[str, np.ndarray], float, bool, dict]: 
         """
         执行一个动作
         
         参数:
-            action: 调度动作 (整数)
+            action: 顺序
             
         返回:
             observation: 新的状态观察值
@@ -140,72 +200,17 @@ class JobSchedulingEnv():
             #self.current_time += 1
             self._update_active_jobs()
             return self._get_observation(), self.reward, False, {}
+        
+        # 截取有效分数（visible_jobs可能少于max_jobs_per_ts）
+        valid_scores = action[:len(self.visible_jobs)]
+        # 按分数降序排列任务索引
+        sorted_indices = np.argsort(-valid_scores)
+        ordered_jobs = [self.visible_jobs[i] for i in sorted_indices]
 
-        # 获取当前待处理的任务
-        current_job = self.visible_jobs[0]
-        done = False
-
-        # 解析动作类型
-        if action <= self.num_nodes - 1:  # 分配到服务器
-            node_id = action
-            allocated = min(
-                current_job.num_gpus - sum(current_job.assigned_gpus),
-                self.cluster_state[node_id]
-            )
-            
-            # 更新集群状态和任务分配
-            self.cluster_state[node_id] -= allocated
-            current_job.assigned_gpus[node_id] += allocated
-
-            required_gpus = current_job.num_gpus - sum(current_job.assigned_gpus)
-
-            
-            # 检查是否分配完成
-            if required_gpus <= 0:
-                self._start_job_execution(current_job)
-            else:  # 分配尚未完成，放到下一轮处理，需要进行惩罚
-                self.wait_jobs.append(current_job)  
-                self.visible_jobs.pop(0)
-                self.reward -=  required_gpus * 5  # 剩余的所需GPU越多，惩罚越大
-
-
-        elif action == self.num_nodes:    # 分配到云
-            if not current_job.privacy:
-                current_job.start = self.current_time
-                current_job.state = 'CLOUD'
-                cloud_cost = current_job.cost
-                self.cloud_cost.append(cloud_cost)
-                self.total_cloud_cost += cloud_cost
-                self.reward -= self.cloud_cost_weight * cloud_cost
-                self.finished_jobs.append(current_job)
-                self.visible_jobs.pop(0)
-            else:  # 如果把隐私任务分到云端则需要加一个很大的惩罚，并且重新分配
-                self.wait_jobs.append(current_job)  
-                self.visible_jobs.pop(0)
-                self.reward -=  500
-
-
-        elif action == self.num_nodes + 1:  # 等待
-            if not self.visible_jobs: # 如果是没有可见任务进行的等待，则不进行任何操作
-                pass
-            else: 
-                required_gpus = current_job.num_gpus - sum(current_job.assigned_gpus)
-                self.wait_jobs.append(current_job)
-                self.visible_jobs.pop(0)
-                # 区分是资源不足导致的等待（给小惩罚）还是有资源时主动等待（给一个大的惩罚）
-                if all(x == 0 for x in self.cluster_state) or (sum(self.cluster_state) < required_gpus): # 如果是资源不足导致任务等待，给一个小惩罚
-                    self.reward -= 5
-                else:
-                    self.reward -= 500
-                    #self.reward -= ((self.current_time + 1) / (current_job.timeslot + 1)) * 5  #  选择一次等待就会给出惩罚，等待越久惩罚越大（这个5也是随便设置的）
-
-        # 不进行时间推进推进模拟时间并更新任务状态
-        #self.current_time += 1
-        #self._update_active_jobs()
-
-        # 验证语句
-        #print(f"Finished: {len(self.finished_jobs)}/50")
-
+        # 按顺序处理每个任务
+        current_job = ordered_jobs.pop(0)
+        self.allocate_one_job(current_job)
+        
         # 检查终止条件
         done = self._is_done()
         return self._get_observation(), self.reward, done, {}
@@ -245,9 +250,9 @@ class JobSchedulingEnv():
         self.total_process_time += job.actual_time
 
         self.active_jobs.append(job)
-        self.visible_jobs.pop(0)
+        self.visible_jobs.remove(job)
         self.reward += ((job.timeslot + 1) / (job.start + 1)) * 5   # 在启动执行时，给一个正奖励函数，越早开始执行奖励越大（这个5是随便设置的）
-        self.reward -= used_nodes_minus_1  # 奖励再减去使用的（节点数-1）
+        self.reward -= used_nodes_minus_1  # 奖励再减去使用的节点数
 
     def _get_actual_time(self, job: Job, inter_nodes_factor=0.1) -> float:
         """计算考虑跨节点惩罚的实际运行时间"""
@@ -312,34 +317,6 @@ class JobSchedulingEnv():
 
         return done
     
-    def get_action_mask(self) -> np.ndarray:
-        """
-        生成动作掩码，1表示有效动作，0表示无效动作
-        注意：假设当前处理队列中的第一个任务（如果有）
-        """
-        mask = [False] * self.action_space.n
-        
-        if not self.visible_jobs:
-            # 空队列时只能选择等待
-            mask[self.num_nodes + 1] = True
-            return mask
-        
-        current_job = self.visible_jobs[0]
-        required_gpus = current_job.num_gpus - sum(current_job.assigned_gpus)
-        
-        # 检查服务器节点选项
-        for node_id in range(self.num_nodes):
-            if self.cluster_state[node_id] >= 1:
-                mask[node_id] = True
-                
-        # 检查云选项（需任务不要求隐私）
-        if not current_job.privacy:
-            mask[self.num_nodes] = True
-            
-        # 等待动作始终有效
-        mask[self.num_nodes + 1] = True
-        
-        return mask
     
     def get_time_statistics(self):
         jct = self.process_time + self.wait_time

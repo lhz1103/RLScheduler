@@ -11,7 +11,6 @@ from job_generator import load_processed_jobs
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
-from datetime import datetime
 
 class PPO:
     def __init__(self, env, device='cuda', 

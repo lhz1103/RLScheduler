@@ -11,7 +11,6 @@ from job_generator import load_processed_jobs
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
-from datetime import datetime
 
 class PPO:
     def __init__(self, env, device='cuda', 
@@ -504,9 +503,6 @@ class PPO:
             f"Active: {np.mean(active_jobs_counts[-episode_steps:]):3.2f}"
             )
             
-            # 定期保存模型
-            today = datetime.now().strftime("%Y-%m-%d")
-            save_dir = os.path.expanduser(f"~/starburst/RLscheduler/checkpoints/{today}")  # ← 你的目标目录
             # 定期保存模型
             if (episode+1) % 50 == 0:
                 torch.save(self.actor.state_dict(), f"ppo_actor_{episode+1}.pth")

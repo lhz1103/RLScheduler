@@ -260,15 +260,15 @@ if __name__ == "__main__":
     FIFO = heuristic(env, strategy = 'FIFO_constant')
     
     # 开始训练
-    rewards_FIFO = FIFO.train(max_episodes=500)
+    #rewards_FIFO = FIFO.train(max_episodes=500)
 
     SJF = heuristic(env, strategy = 'SJF_constant')
-    rewards_SJF = SJF.train(max_episodes=500)
+    #rewards_SJF = SJF.train(max_episodes=500)
     SGF = heuristic(env, strategy = 'SmallGPUsFirst_constant')
-    rewards_SGF = SGF.train(max_episodes=500)
+    #rewards_SGF = SGF.train(max_episodes=500)
 
     BGF = heuristic(env, strategy = 'BigGPUsFirst_constant')
-    #rewards_BGF = BGF.train(max_episodes=500)
+    rewards_BGF = BGF.train(max_episodes=500)
 
     LJF = heuristic(env, strategy = 'LongestJobFirst_constant')
-    #rewards_LJF = LJF.train(max_episodes=500)
+    rewards_LJF = LJF.train(max_episodes=500)

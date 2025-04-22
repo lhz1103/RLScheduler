@@ -78,7 +78,7 @@ class JobSchedulingEnv():
         """
         dataset_config = {
         'dataset': 'philly_gen',
-        'arrival_rate': 60,  # 每时隙20个任务
+        'arrival_rate': 48,  # 每时隙16个任务
         'cv_factor': 1.0,
         'total_jobs': 100,
         'seed': seed,
@@ -238,7 +238,7 @@ class JobSchedulingEnv():
         """启动任务执行，并添加奖励"""
         job.start = self.current_time
         job.state = 'LOCAL'
-        job.actual_time, used_nodes_minus_1 = self._get_actual_time(job)
+        job.actual_time, used_nodes = self._get_actual_time(job)
 
         # 记录处理的时间（计算+通信延迟）
         self.process_time.append(job.actual_time)
@@ -247,7 +247,7 @@ class JobSchedulingEnv():
         self.active_jobs.append(job)
         self.visible_jobs.pop(0)
         self.reward += ((job.timeslot + 1) / (job.start + 1)) * 5   # 在启动执行时，给一个正奖励函数，越早开始执行奖励越大（这个5是随便设置的）
-        self.reward -= used_nodes_minus_1  # 奖励再减去使用的（节点数-1）
+        self.reward -= used_nodes  # 奖励再减去使用的节点数
 
     def _get_actual_time(self, job: Job, inter_nodes_factor=0.1) -> float:
         """计算考虑跨节点惩罚的实际运行时间"""

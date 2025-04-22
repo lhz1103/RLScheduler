@@ -55,27 +55,31 @@ class PPO:
             'cluster': torch.IntTensor(state['cluster']).unsqueeze(0).to(self.device)
         }
     
-    def get_action(self, state, action_mask):
+    def get_action(self, state):
         """
-        带掩码的动作选择
-        返回动作、对数概率、价值估计
+        返回 (action_scores_vec, action_idx, log_prob, value)
+        action_scores_vec   : 发给 env.step() 的长度 = max_jobs 的一维 numpy
+        action_idx          : 当前策略抽样 / argmax 得到的离散动作（任务下标）
         """
         with torch.no_grad():
-            state_tensor = self.preprocess_state(state)
-            logits = self.actor(state_tensor)
-            
-            # 应用动作掩码
-            mask_tensor = torch.tensor(np.array(action_mask), dtype=torch.bool, device=self.device).unsqueeze(0)  # 构建掩码张量
-            #logits[~mask_tensor] = -float('inf') # 将不允许选择的动作对应的 logits 设为负无穷，使得后续 softmax 后概率趋近于 0
-            
-            probs = F.softmax(logits, dim=-1)
-            dist = Categorical(probs)
-            action = dist.sample()
-            
-            log_prob = dist.log_prob(action)
-            value = self.critic(state_tensor)
-            
-        return action.item(), log_prob.item(), value.item()
+            s = self.preprocess_state(state)                 # dict -> batch(1,…)
+            logits = self.actor(s).squeeze(0)               # [max_jobs]
+            probs  = F.softmax(logits, dim=-1)              # 有效任务上的分布
+
+            dist   = Categorical(probs)
+            action_idx = dist.sample()                      # <<< ① 采样一个索引  ( exploration )
+
+            log_prob = dist.log_prob(action_idx)            # 对应 log π(a|s)
+            value    = self.critic(s).squeeze(0)
+
+            # ② 构造发送给环境的分数向量：保证抽到的 idx 拥有最高分
+            action_scores = torch.zeros_like(probs)
+            action_scores[action_idx] = 1.0                 # one‑hot 即可
+            # 如果想保留排序信息，可用
+            # action_scores = probs.clone(); action_scores[action_idx] += 1e-3
+
+        return action_scores.cpu().numpy(), action_idx.item(), log_prob.item(), value.item()
+
     
     def compute_gae(self, rewards, values, dones):
         """计算广义优势估计
@@ -99,75 +103,59 @@ class PPO:
         advantages = advantages[::-1]
         return torch.tensor(advantages, dtype=torch.float32).to(self.device)
     
+    def compute_ranking_loss(self, pred_scores, target_orders):
+        """计算排序损失"""
+        batch_loss = 0
+        for pred, target in zip(pred_scores, target_orders):
+            valid_length = len(target)
+            for i in range(valid_length):
+                for j in range(i+1, valid_length):
+                    # 确保目标中靠前的任务得分更高
+                    batch_loss += torch.log(1 + 
+                        torch.exp(pred[target[j]] - pred[target[i]]))
+        return batch_loss
+    
     def update(self):
-        """执行PPO更新"""
-        # 将缓存数据转换为张量
-        states, actions, old_log_probs, rewards, dones, masks = zip(*self.buffer)
-        
-        # 转换为PyTorch张量
+        states, actions_idx, old_log_p, rewards, dones = zip(*self.buffer)
+
+        # 1 张量化
         states = [self.preprocess_state(s) for s in states]
-        actions = torch.LongTensor(actions).to(self.device)
-        old_log_probs = torch.FloatTensor(old_log_probs).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
-        
-        masks_np = np.array(masks, dtype=bool)  # 先转换为numpy数组
-        masks = torch.from_numpy(masks_np).to(self.device)  # 再转换为tensor
-        
-        # 计算优势
+        actions_idx = torch.LongTensor(actions_idx).to(self.device)
+        old_log_p   = torch.FloatTensor(old_log_p).to(self.device)
+        rewards     = torch.FloatTensor(rewards).to(self.device)
+        dones       = torch.FloatTensor(dones).to(self.device)
+
+        # 2 价值 & GAE
         with torch.no_grad():
-            values = torch.stack([self.critic(s) for s in states]).squeeze()
-        advantages = self.compute_gae(rewards, values, dones)
-        returns = advantages + values
-        
-        # 标准化优势
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # 数据索引
-        indices = np.arange(len(states))
-        
-        # 训练多个epoch
+            values = torch.cat([self.critic(s) for s in states]).squeeze(-1)
+        adv = self.compute_gae(rewards, values, dones)
+        returns = adv + values
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # 3 PPO 多轮 mini‑batch
+        idxs = np.arange(len(states))
         for _ in range(self.ppo_epochs):
-            np.random.shuffle(indices)
-            
-            # 分批次训练
-            for start in range(0, len(indices), self.batch_size):
-                end = start + self.batch_size
-                batch_indices = indices[start:end]
-                
-                batch_states = [states[i] for i in batch_indices]
-                batch_actions = actions[batch_indices]
-                batch_old_log_probs = old_log_probs[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_returns = returns[batch_indices]
-                batch_masks = masks[batch_indices].unsqueeze(1)  # 添加一个维度以匹配logits形状
-                
-                # 计算新策略的概率
-                current_logits = torch.stack([self.actor(s) for s in batch_states])
-                current_logits[~batch_masks] = -float('inf')  # 应用掩码
-                current_probs = F.softmax(current_logits, dim=-1)
-                dist = Categorical(current_probs)
-                current_log_probs = dist.log_prob(batch_actions)
-                
-                # 计算比率
-                ratios = torch.exp(current_log_probs - batch_old_log_probs)
-                
-                # 计算策略损失
-                surr1 = ratios * batch_advantages
-                surr2 = torch.clamp(ratios, 1-self.clip_epsilon, 1+self.clip_epsilon) * batch_advantages
+            np.random.shuffle(idxs)
+            for start in range(0, len(idxs), self.batch_size):
+                batch = idxs[start:start+self.batch_size]
+
+                # (batch, max_jobs)  ← actor 每次 forward 1 个 state
+                logits = torch.cat([self.actor(states[i]) for i in batch])
+                probs  = F.softmax(logits, dim=-1)
+                dist   = Categorical(probs)
+
+                new_log_p = dist.log_prob(actions_idx[batch])
+
+                ratio = torch.exp(new_log_p - old_log_p[batch])
+                surr1 = ratio * adv[batch]
+                surr2 = torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon) * adv[batch]
                 policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # 计算价值损失
-                #current_values = torch.stack([self.critic(s) for s in batch_states]).squeeze()
-                #value_loss = F.mse_loss(current_values, batch_returns)
-                current_values = torch.stack([self.critic(s).view(-1) for s in batch_states])  # 确保形状为 [batch_size, 1]
-                batch_returns = batch_returns.view(-1, 1)  # 匹配维度
-                value_loss = F.mse_loss(current_values, batch_returns)
-                
-                # 总损失
+
+                values_pred = torch.cat([self.critic(states[i]) for i in batch]).squeeze(-1)
+                value_loss  = F.mse_loss(values_pred, returns[batch])
+
                 loss = policy_loss + 0.5 * value_loss
-                
-                # 反向传播
+
                 self.actor_optim.zero_grad()
                 self.critic_optim.zero_grad()
                 loss.backward()
@@ -175,12 +163,12 @@ class PPO:
                 nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.actor_optim.step()
                 self.critic_optim.step()
-        
-        # 清空缓存
+
         self.buffer.clear()
 
+
     def plot_train_metrics(self, episode_rewards, queue_lengths, visible_jobs_counts, active_jobs_counts):
-        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures")
+        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures_order")
         os.makedirs(fig_dir, exist_ok=True)
         plt.figure(figsize=(15, 10))
     
@@ -224,7 +212,7 @@ class PPO:
         df_rewards.to_excel(os.path.join(fig_dir, 'Rewards.xlsx'))
     
     def plot_jct_statistics(self, episode_jct_mean, episode_jct_p95, episode_jct_p99):
-        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures")
+        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures_order")
         os.makedirs(fig_dir, exist_ok=True)
         plt.figure(figsize=(15, 10))
 
@@ -272,7 +260,7 @@ class PPO:
         df_p99.to_excel(os.path.join(fig_dir, 'P99_JCT_hours.xlsx'))
     
     def plot_wait_time_statistics(self, episode_wait_time_mean, episode_wait_time_p95, episode_wait_time_p99):
-        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures")
+        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures_order")
         os.makedirs(fig_dir, exist_ok=True)
         plt.figure(figsize=(15, 10))
 
@@ -320,7 +308,7 @@ class PPO:
         df_p99.to_excel(os.path.join(fig_dir, 'P99_Wait_Time_hours.xlsx'))
 
     def plot_cloud_cost_statistics(self, episode_cloud_cost_mean, episode_cloud_cost_p95, episode_cloud_cost_p99):
-        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures")
+        fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures_order")
         os.makedirs(fig_dir, exist_ok=True)
         plt.figure(figsize=(15, 10))
 
@@ -429,10 +417,9 @@ class PPO:
                 # 收集经验
                 #for _ in range(update_interval):
                 while self.env.visible_jobs:  # 处理当前时隙所有可见任务
-                    action_mask = self.env.get_action_mask()
-                    action, log_prob, value = self.get_action(state, action_mask)
+                    action_scores, action_idx, log_p, value = self.get_action(state)
                     
-                    next_state, reward, done, _ = self.env.step(action)
+                    next_state, reward, done, _ = self.env.step(action_scores)
                     
                     # 收集指标
                     queue_lengths.append(len(self.env.queue))
@@ -445,11 +432,10 @@ class PPO:
                     # 存储转换
                     self.buffer.append((
                         state,
-                        action,
-                        log_prob,
+                        action_idx,
+                        log_p,
                         reward,
-                        done,
-                        action_mask
+                        done
                     ))
 
                     # 验证语句
@@ -506,11 +492,11 @@ class PPO:
             
             # 定期保存模型
             today = datetime.now().strftime("%Y-%m-%d")
-            save_dir = os.path.expanduser(f"~/starburst/RLscheduler/checkpoints/{today}")  # ← 你的目标目录
-            # 定期保存模型
+            save_dir = os.path.expanduser(f"~/starburst/RLscheduler/checkpoints_order/{today}")  # ← 你的目标目录
+            os.makedirs(save_dir, exist_ok=True)
             if (episode+1) % 50 == 0:
-                torch.save(self.actor.state_dict(), f"ppo_actor_{episode+1}.pth")
-                torch.save(self.critic.state_dict(), f"ppo_critic_{episode+1}.pth")
+                torch.save(self.actor.state_dict(), os.path.join(save_dir, f"ppo_actor_{episode+1}.pth"))
+                torch.save(self.critic.state_dict(), os.path.join(save_dir, f"ppo_critic_{episode+1}.pth"))
         
         # 训练结束后绘图
         self.plot_train_metrics(
