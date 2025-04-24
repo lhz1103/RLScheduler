@@ -99,9 +99,6 @@ class JobSchedulingEnv():
             fill_value=self.num_gpus_per_node,
             dtype=np.int32
         )
-        """
-        在一开始就设置好deadline，如果是启发式算法的话则再修改
-        """
         for job in init_jobs:
             if job.privacy:  # 隐私任务只能放在队列中
                 job.deadline = 1e12

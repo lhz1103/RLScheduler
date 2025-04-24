@@ -540,4 +540,4 @@ if __name__ == "__main__":
     ppo = PPO(env, device=device)
     
     # 开始训练
-    rewards = ppo.train(max_episodes=500)
+    rewards = ppo.train(max_episodes=100)

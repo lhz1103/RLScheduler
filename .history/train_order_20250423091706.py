@@ -463,7 +463,7 @@ class PPO:
                 
 
                 # 验证语句
-                print(f"Finished: {len(self.env.finished_jobs)}/1000")
+                print(f"Finished: {len(self.env.finished_jobs)}/100")
             
             # 记录统计数据
             jct_mean, jct_p95, jct_p99, wait_time_mean, wait_time_p95, wait_time_p99 = self.env.get_time_statistics()

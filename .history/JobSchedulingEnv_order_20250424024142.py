@@ -99,14 +99,6 @@ class JobSchedulingEnv():
             fill_value=self.num_gpus_per_node,
             dtype=np.int32
         )
-        """
-        在一开始就设置好deadline，如果是启发式算法的话则再修改
-        """
-        for job in init_jobs:
-            if job.privacy:  # 隐私任务只能放在队列中
-                job.deadline = 1e12
-            else:    
-                job.deadline = job.runtime * job.num_gpus * 1
         
         # 任务队列管理
         self.total_jobs = copy.deepcopy(init_jobs)  # 总体的任务队列
@@ -132,6 +124,10 @@ class JobSchedulingEnv():
     def allocate_one_job(self, job:Job):
         # 尝试在集群中分配资源
         required_gpus = job.num_gpus - sum(job.assigned_gpus)
+        if job.privacy:  # 隐私任务只能放在队列中
+            job.deadline = 1e12
+        else:    
+            job.deadline = job.runtime * job.num_gpus * 1
         allocated = False
         
         # 集群中有足够资源时

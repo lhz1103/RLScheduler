@@ -417,7 +417,6 @@ class PPO:
                 # 收集经验
                 #for _ in range(update_interval):
                 while self.env.visible_jobs:  # 处理当前时隙所有可见任务
-
                     action_scores, action_idx, log_p, value = self.get_action(state)  # 这里给出的action_idx是当前visible_jobs中的索引，并非job的idx
                     
                     next_state, reward, done, _ = self.env.step(action_idx)
@@ -463,7 +462,7 @@ class PPO:
                 
 
                 # 验证语句
-                print(f"Finished: {len(self.env.finished_jobs)}/1000")
+                print(f"Finished: {len(self.env.finished_jobs)}/100")
             
             # 记录统计数据
             jct_mean, jct_p95, jct_p99, wait_time_mean, wait_time_p95, wait_time_p99 = self.env.get_time_statistics()

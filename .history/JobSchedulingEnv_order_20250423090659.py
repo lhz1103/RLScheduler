@@ -99,14 +99,6 @@ class JobSchedulingEnv():
             fill_value=self.num_gpus_per_node,
             dtype=np.int32
         )
-        """
-        在一开始就设置好deadline，如果是启发式算法的话则再修改
-        """
-        for job in init_jobs:
-            if job.privacy:  # 隐私任务只能放在队列中
-                job.deadline = 1e12
-            else:    
-                job.deadline = job.runtime * job.num_gpus * 1
         
         # 任务队列管理
         self.total_jobs = copy.deepcopy(init_jobs)  # 总体的任务队列
@@ -131,7 +123,11 @@ class JobSchedulingEnv():
         
     def allocate_one_job(self, job:Job):
         # 尝试在集群中分配资源
-        required_gpus = job.num_gpus - sum(job.assigned_gpus)
+        required_gpus = job.num_gpus
+        if job.privacy:  # 隐私任务只能放在队列中
+            job.deadline = 1e12
+        else:    
+            job.deadline = job.runtime * job.num_gpus * 1
         allocated = False
         
         # 集群中有足够资源时
@@ -203,7 +199,7 @@ class JobSchedulingEnv():
         """
         
         # 加载新到达的任务到队列
-        #self._load_jobs()
+        self._load_jobs()
 
         # 终止条件检查
         if self._is_done():
@@ -277,15 +273,10 @@ class JobSchedulingEnv():
 
     def _update_active_jobs(self):
         """更新运行中的任务状态"""
-        # 把 wait_jobs 的全部元素搬到 queue 前端
-        if self.wait_jobs:
-            self.queue[0:0] = self.wait_jobs     # 等价于 queue = wait_jobs + queue
-
-            # 或者：for job in self.wait_jobs[::-1]: self.queue.insert(0, job)
-
-            # 清空 wait_jobs
-            self.wait_jobs.clear()
-
+        for job in self.wait_jobs:
+            self.queue.append(job)
+            self.wait_jobs.remove(job)
+        
         remaining = []
         for job in self.active_jobs:
             job.actual_time -= 20 / 60  # 模拟时间推进20分钟

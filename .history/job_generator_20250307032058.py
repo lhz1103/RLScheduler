@@ -157,8 +157,7 @@ def generate_philly_gpu_jobs(philly_jobs: List['JobTrace'],
     np.random.seed(seed)
     job_indexes = np.random.choice(list(range(len(run_times))),
                                    size=total_jobs,
-                                   #replace=True
-                                   replace=False)  # 从原任务列表中随机采样total_jobs个任务，任务索引范围为len(run_times)
+                                   replace=True)  # 从原任务列表中随机采样total_jobs个任务，任务索引范围为len(run_times)
     proc_jobs = []
     for idx in range(total_jobs):
         job_idx = job_indexes[idx]
@@ -217,8 +216,7 @@ def generate_helios_jobs(helios_jobs: List['HeliosJobTrace'],
     np.random.seed(seed)
     job_indexes = np.random.choice(list(range(len(run_times))),
                                    size=total_jobs,
-                                   #replace=True
-                                   replace=False)
+                                   replace=True)
     proc_jobs = []
     for idx in range(total_jobs):
         job_idx = job_indexes[idx]
