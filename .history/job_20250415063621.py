@@ -11,11 +11,8 @@ class Job(object):
         # Original arrival time for job.
         self.arrival = arrival  # 任务的到达时间是相对的，以第一个任务到达时间为0，后续任务和它的差值即到达时间，单位是小时
         self.runtime = runtime  # 单位也是小时
-
         self.deadline = deadline  # 等待时间上限
         self.waiting = False  # 记录是否已经在等待
-        self.waitingtime = 0.0 # 记录已经等待的时间
-
         self.num_gpus = num_gpus
 
         self.cost = cost
@@ -33,9 +30,6 @@ class Job(object):
 
         # 根据分配的服务器数量调整实际的运行时间，也是我自定义
         self.actual_time = 0.0
-        
-        # 记录已经处理的时间
-        self.processing_time = 0.0
 
         # 任务所属的时隙
         self.timeslot = -1
@@ -69,4 +63,4 @@ class Job(object):
         self.deadline = deadline
 
     def __repr__(self):
-        return f'Job(idx={self.idx}, state={self.state}, gpus={self.num_gpus}, arr={self.arrival}, timeslot={self.timeslot}, run={self.runtime}, actual={self.actual_time}, deadline={self.deadline}, start={self.start}, privacy={self.privacy}, waitingtime={self.waitingtime}, assigned={self.assigned_gpus})\n'
+        return f'Job(idx={self.idx}, state={self.state}, gpus={self.num_gpus}, arr={self.arrival}, timeslot={self.timeslot}, run={self.runtime}, actual={self.actual_time}, deadline={self.deadline}, start={self.start}, privacy={self.privacy}, assigned={self.assigned_gpus})\n'

@@ -6,10 +6,10 @@ from gym.spaces import Sequence, Box
 from job import Job
 import copy
 from job_generator import load_processed_jobs
-
+from EMA_Normalizer import EmaNormalizer
 
 class JobSchedulingEnv():
-    def __init__(self, num_nodes=8, num_gpus_per_node=8, cloud_cost_weight=1, max_jobs_per_ts = 20):
+    def __init__(self, num_nodes=8, num_gpus_per_node=8, cloud_cost_weight=1, max_jobs_per_ts = 20, alpha=1.0, beta=2.0, gamma=3.0, kappa=0.5):
         """
         基于PyTorch的任务调度环境
         
@@ -72,6 +72,22 @@ class JobSchedulingEnv():
         self.cloud_cost = []
         self.total_cloud_cost = 0.0  # 累计云成本
 
+        # 奖励系数
+        self.alpha = alpha  # 任务量系数
+        self.beta = beta  # 成本系数
+        self.gamma = gamma  # 上云被拒绝系数
+        self.kappa = kappa  # 任务在本地完成的奖励
+
+        # 成本预算
+        self.budget_cap = 0.0
+        self.budget_left = 0.0
+        self.block_happend = False
+
+        # 归一化器
+        self.norm_W = EmaNormalizer(rho=0.97, warmup_steps=15)
+        self.norm_C = EmaNormalizer(rho=0.97, warmup_steps=15)
+
+
         # 初始化环境状态
         #self.reset()
 
@@ -101,13 +117,23 @@ class JobSchedulingEnv():
         )
         """
         在一开始就设置好deadline，如果是启发式算法的话则再修改
+        把总体预算设置为所有任务都上云（最坏情况下）的0.6倍
         """
         for job in init_jobs:
             if job.privacy:  # 隐私任务只能放在队列中
                 job.deadline = 1e12
             else:    
-                job.deadline = job.runtime * job.num_gpus * 1
+                job.deadline = job.cost * 1
+                budget += job.cost
         
+        self.budget_cap = budget * 0.6
+        self.budget_left = budget * 0.6
+        self.block_happend = False
+
+        # 归一化器
+        self.norm_W = EmaNormalizer(rho=0.97, warmup_steps=15)
+        self.norm_C = EmaNormalizer(rho=0.97, warmup_steps=15)
+
         # 任务队列管理
         self.total_jobs = copy.deepcopy(init_jobs)  # 总体的任务队列
         self.queue = []           # 等待调度的任务队列
@@ -133,6 +159,17 @@ class JobSchedulingEnv():
         # 尝试在集群中分配资源
         required_gpus = job.num_gpus - sum(job.assigned_gpus)
         allocated = False
+
+        # 单服务器任务：required_gpus <= self.num_gpus_per_node
+        if required_gpus <= self.num_gpus_per_node:
+            cand = [(free, idx) for idx, free in enumerate(self.cluster_state)
+                     if free >= need_gpu]
+            if cand:                                     # 找得到
+                free_gpu, node = min(cand)               # 剩余最少者
+                self.cluster_state[node] -= need_gpu
+                job.assigned_gpus[node] += need_gpu
+                self._start_job_execution(job)
+
         
         # 集群中有足够资源时
         if sum(self.cluster_state) >= required_gpus:

@@ -6,10 +6,11 @@ from gym.spaces import Sequence, Box
 from job import Job
 import copy
 from job_generator import load_processed_jobs
-
+from EMA_Normalizer import EmaNormalizer
+from utils_order import _top_k_nodes_by_free
 
 class JobSchedulingEnv():
-    def __init__(self, num_nodes=8, num_gpus_per_node=8, cloud_cost_weight=1, max_jobs_per_ts = 20):
+    def __init__(self, num_nodes=8, num_gpus_per_node=8, cloud_cost_weight=1, max_jobs_per_ts = 20, alpha=1.0, beta=2.0, gamma=3.0, kappa=0.5):
         """
         基于PyTorch的任务调度环境
         
@@ -72,6 +73,22 @@ class JobSchedulingEnv():
         self.cloud_cost = []
         self.total_cloud_cost = 0.0  # 累计云成本
 
+        # 奖励系数
+        self.alpha = alpha  # 任务量系数
+        self.beta = beta  # 成本系数
+        self.gamma = gamma  # 上云被拒绝系数
+        self.kappa = kappa  # 任务在本地完成的奖励
+
+        # 成本预算
+        self.budget_cap = 0.0
+        self.budget_left = 0.0
+        self.block_happend = False
+
+        # 归一化器
+        self.norm_W = EmaNormalizer(rho=0.97, warmup_steps=15)
+        self.norm_C = EmaNormalizer(rho=0.97, warmup_steps=15)
+
+
         # 初始化环境状态
         #self.reset()
 
@@ -101,13 +118,23 @@ class JobSchedulingEnv():
         )
         """
         在一开始就设置好deadline，如果是启发式算法的话则再修改
+        把总体预算设置为所有任务都上云（最坏情况下）的0.6倍
         """
         for job in init_jobs:
             if job.privacy:  # 隐私任务只能放在队列中
                 job.deadline = 1e12
             else:    
-                job.deadline = job.runtime * job.num_gpus * 1
+                job.deadline = job.cost * 1
+                budget += job.cost
         
+        self.budget_cap = budget * 0.6
+        self.budget_left = budget * 0.6
+        self.block_happend = False
+
+        # 归一化器
+        self.norm_W = EmaNormalizer(rho=0.97, warmup_steps=15)
+        self.norm_C = EmaNormalizer(rho=0.97, warmup_steps=15)
+
         # 任务队列管理
         self.total_jobs = copy.deepcopy(init_jobs)  # 总体的任务队列
         self.queue = []           # 等待调度的任务队列
@@ -128,63 +155,106 @@ class JobSchedulingEnv():
         # 加载初始任务到队列
         #self._load_jobs()
         return self._get_observation()
+    
+    def check_waiting_status(self, job: Job):
+        """步骤2：判断任务是否等待中，且是否超过等待时间阈值"""
+        if job.waiting:
+            # 计算等待的时间是否超过上限
+            if job.waitingtime >= job.deadline:
+                # 等待时间超过阈值，进入步骤 3：判断费用上限
+                self.handle_cloud_allocation(job)
+            else:
+                # 任务还在等待，可以继续判断是否需要等待
+                self.handle_waiting_or_return(job)
+        else:
+            # 如果任务不在等待队列，进入步骤4：判断是否继续等待
+            self.handle_waiting_or_return(job)
+            
+    def handle_cloud_allocation(self, job: Job):
+        """步骤3：判断是否有足够的预算上云"""
+        if self.total_cloud_cost + job.cost <= self.budget_cap:
+            # 云费用未超过上限，选择上云
+            self.allocate_to_cloud(job)
+        else:
+            # 超过预算，放回等待队列
+            self.wait_jobs.append(job)
+            job.waiting = True
+            job.waitingtime += 20 / 60
+            if job.waitingtime < job.deadline:  # 还没到deadline，虽然在步骤4中判断已经没必要等待了，但是理论上也可以继续等下去
+                self.visible_jobs.remove(job)
+            else:  # 已经超时需要上云，但由于预算原因无法上云，此时触发block
+                self.block_happend = True
+                self.visible_jobs.remove(job)
+
+    def handle_waiting_or_return(self, job: Job):
+        """步骤4：根据预测的等待时间判断是否放回等待队列"""
+        # 预测等待时间（模拟）
+        predicted_wait_time = self.predict_waiting_time(job)
         
+        if predicted_wait_time <= (job.deadline - job.waitingtime):
+            # 预测时间小于等于阈值，可以继续等待
+            self.wait_jobs.append(job)
+            job.waiting = True
+            job.waitingtime += 20 / 60  # 更新等待时间
+            self.visible_jobs.remove(job)
+        else:
+            # 等待时间太长，尝试上云
+            self.handle_cloud_allocation(job)
+
+    def allocate_to_cloud(self, job:Job):
+        cloud_cost = job.cost
+        self.cloud_cost.append(cloud_cost)
+        self.total_cloud_cost += cloud_cost
+        job.start = self.current_time
+        job.state = 'CLOUD'
+        self.finished_jobs.append(job)
+        self.visible_jobs.remove(job)
+
     def allocate_one_job(self, job:Job):
-        # 尝试在集群中分配资源
         required_gpus = job.num_gpus - sum(job.assigned_gpus)
         allocated = False
-        
-        # 集群中有足够资源时
-        if sum(self.cluster_state) >= required_gpus:
-            # 策略1: 优先寻找能一次性分配的单节点
-            for node_id in range(self.num_nodes):
-                if self.cluster_state[node_id] >= required_gpus:
-                    self.cluster_state[node_id] -= required_gpus
-                    job.assigned_gpus[node_id] = required_gpus
-                    self._start_job_execution(job)
-                    allocated = True
-                    break
-            # 策略2: 跨节点分配
-            if (not allocated) and (required_gpus <= sum(self.cluster_state)):
-            # 跨节点分配逻辑（需计算实际运行时间）
-                allocated_gpus = 0
-                used_nodes = []
+        # 单服务器任务：required_gpus <= self.num_gpus_per_node
+        if required_gpus <= self.num_gpus_per_node:
+            # Best-Fit：挑空闲 GPU 最少且能装下的节点
+            cand = [(free, idx) for idx, free in enumerate(self.cluster_state)
+                     if free >= required_gpus]
+            if cand:                                     # 找得到
+                free_gpu, node = min(cand)               # 剩余最少者
+                self.cluster_state[node] -= required_gpus
+                job.assigned_gpus[node] += required_gpus
+                self._start_job_execution(job)
+                return
+        else:  # 多服务器任务
+            remaining_gpu = required_gpus
+            used_nodes = {}
 
-                for node_id in range(self.num_nodes):
-                    alloc = min(self.cluster_state[node_id], required_gpus - sum(job.assigned_gpus))
-                    if alloc > 0:
-                        self.cluster_state[node_id] -= alloc
-                        job.assigned_gpus[node_id] += alloc
-                        allocated_gpus += alloc
-                        used_nodes.append(node_id)
-                    elif allocated_gpus >= required_gpus:
-                        self._start_job_execution(job)
-                        allocated = True
-                        break   
-        # 集群没有足够资源时 
+            # 选空闲最多的节点，逐个加直到满足需求
+            cand_nodes = _top_k_nodes_by_free(self.cluster_state, self.num_nodes)
+            for node in cand_nodes:
+                if self.cluster_state[node] > 0:
+                    used_gpus = min(self.cluster_state[node], remaining_gpu)
+                    remaining_gpu -= used_gpus
+                    used_nodes[node] = used_gpus
+                    if remaining_gpu <= 0:
+                        break
+            
+            if remaining_gpu <= 0:  # 资源已足够，开始执行
+                for node, gpus in used_nodes.items():
+                    job.assigned_gpus[node] += gpus
+                    self.cluster_state[node] -= gpus
+                self._start_job_execution(job)
+                return
+        
+        if not job.privacy:
+
+
+       
         else:
-            if job.deadline > 0:
-                # 策略3: 等待
-                self.wait_jobs.append(job)
-                job.deadline -= 20 / 60
-                job.waitingtime += 20 / 60
-                self.visible_jobs.remove(job)
-                # 区分是资源不足导致的等待（给小惩罚）还是有资源时主动等待（给一个大的惩罚）
-                if all(x == 0 for x in self.cluster_state) or (sum(self.cluster_state) < required_gpus): # 如果是资源不足导致任务等待，给一个小惩罚
-                    self.reward -= 5
-                else:
-                    self.reward -= 500
-            # 策略4: 若无法在集群分配且允许上云
-            elif not allocated and not job.privacy and job.deadline <= 0:
-                cloud_cost = job.cost
-                self.cloud_cost.append(cloud_cost)
-                self.total_cloud_cost += cloud_cost
-                job.start = self.current_time
-                job.state = 'CLOUD'
-                self.reward -= self.cloud_cost_weight * cloud_cost
-                self.finished_jobs.append(job)
-                self.visible_jobs.remove(job)
-                allocated = True
+
+
+
+        
+        
 
 
     def step(self, action: int) -> tuple[Dict[str, np.ndarray], float, bool, dict]: 

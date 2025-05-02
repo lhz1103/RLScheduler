@@ -6,7 +6,7 @@ from gym.spaces import Sequence, Box
 from job import Job
 import copy
 from job_generator import load_processed_jobs
-
+from EMA_Normalizer import EmaNormalizer
 
 class JobSchedulingEnv():
     def __init__(self, num_nodes=8, num_gpus_per_node=8, cloud_cost_weight=1, max_jobs_per_ts = 20):

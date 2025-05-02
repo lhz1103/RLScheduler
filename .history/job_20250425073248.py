@@ -33,9 +33,6 @@ class Job(object):
 
         # 根据分配的服务器数量调整实际的运行时间，也是我自定义
         self.actual_time = 0.0
-        
-        # 记录已经处理的时间
-        self.processing_time = 0.0
 
         # 任务所属的时隙
         self.timeslot = -1
