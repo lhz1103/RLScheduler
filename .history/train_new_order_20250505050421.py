@@ -306,39 +306,31 @@ class PPO:
         df_p99 = pd.DataFrame([episode_wait_time_p99], columns=episode_numbers, index=['RL'])
         df_p99.to_excel(os.path.join(fig_dir, 'P99_Wait_Time_hours.xlsx'))
 
-    def plot_cloud_cost_statistics(self, episode_cloud_cost_mean, episode_cloud_cost_p95, episode_cloud_cost_p99, episode_total_cost, episode_budget):
+    def plot_cloud_cost_statistics(self, episode_cloud_cost_mean, episode_cloud_cost_p95, episode_cloud_cost_p99):
         fig_dir = os.path.expanduser("~/starburst/RLscheduler/figures_new_order")
         os.makedirs(fig_dir, exist_ok=True)
-        plt.figure(figsize=(15, 12))
+        plt.figure(figsize=(15, 10))
 
-        # 第一个子图：Episode Mean Cloud Cost
-        plt.subplot(4, 1, 1)
+        # 第一个子图：Episode Mean Wait Time
+        plt.subplot(3, 1, 1)
         plt.plot(episode_cloud_cost_mean, color='tab:blue', alpha=0.7)
         plt.title('Episode Mean Cloud Cost')
         plt.xlabel('Episode')
         plt.ylabel('Mean Cloud Cost')
 
-        # 第二个子图：Episode P95 Cloud Cost
-        plt.subplot(4, 1, 2)
+        # 第二个子图：Episode P95 Wait Time
+        plt.subplot(3, 1, 2)
         plt.plot(episode_cloud_cost_p95, color='tab:orange', alpha=0.7)
         plt.title('Episode P95 Cloud Cost')
         plt.xlabel('Episode')
         plt.ylabel('P95 Cloud Cost')
 
-        # 第三个子图：Episode P99 Cloud Cost
-        plt.subplot(4, 1, 3)
+        # 第三个子图：Episode P99 Wait Time
+        plt.subplot(3, 1, 3)
         plt.plot(episode_cloud_cost_p99, color='tab:red', alpha=0.7)
         plt.title('Episode P99 Cloud Cost')
         plt.xlabel('Episode')
         plt.ylabel('P99 Cloud Cost')
-
-        # 第四个子图：Episode Total Cost to Budget Ratio
-        ratio = [total / budget if budget != 0 else 0 for total, budget in zip(episode_total_cost, episode_budget)]
-        plt.subplot(4, 1, 4)
-        plt.plot(ratio, color='tab:green', alpha=0.7)
-        plt.title('Episode Total Cost / Budget Ratio')
-        plt.xlabel('Episode')
-        plt.ylabel('Cost to Budget Ratio')
 
         # 自动调整子图间距
         plt.tight_layout()
@@ -361,10 +353,6 @@ class PPO:
         # P99 Cloud Cost
         df_p99 = pd.DataFrame([episode_cloud_cost_p99], columns=episode_numbers, index=['RL'])
         df_p99.to_excel(os.path.join(fig_dir, 'P99_Cloud_Cost.xlsx'))
-
-        # Cost to Budget Ratio
-        df_ratio = pd.DataFrame([ratio], columns=episode_numbers, index=['RL'])
-        df_ratio.to_excel(os.path.join(fig_dir, 'Cost_to_Budget_Ratio.xlsx'))
     
     def append_method_to_excel(file_path, method_name, data_row):
         '''往excel里添加其他方法的数据'''

@@ -142,8 +142,8 @@ class JobSchedulingEnv():
                 job.deadline = job.cost * 1
                 budget += job.cost
         
-        self.budget_cap = budget * 0.006
-        self.budget_remain = budget * 0.006
+        self.budget_cap = budget * 0.6
+        self.budget_remain = budget * 0.6
         self.block_happend = False
 
         # 归一化器
