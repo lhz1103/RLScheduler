@@ -1,0 +1,764 @@
+import numpy as np
+import torch
+from typing import List, Dict, Any
+from gym import spaces
+from gym.spaces import Sequence, Box
+from job import Job
+import copy
+import math
+from job_generator import load_processed_jobs
+from EMA_Normalizer import EmaNormalizer
+from utils_order import _top_k_nodes_by_free
+
+"""
+5.16：
+1. 在状态中删除id、到达时间和隐私，并添加cost；
+
+5.19：
+1. 在4层8头transformer模型上，修改奖励：
+  a. 把W_t修改为超线性增长；
+  b. 任务在本地完成修改为与任务量有关：在原来的参数基础上除以任务量，实现小任务奖励大、大任务奖励小；
+  c. 添加一个事件奖励：选取任务后，加入正奖励，同样给出小任务奖励大、大任务奖励小；
+
+
+"""
+
+class JobSchedulingEnv():
+    def __init__(self, num_nodes=16, num_gpus_per_node=8, cloud_cost_weight=1, max_jobs_per_ts=20,    # 集群参数
+                 alpha=1.0, beta=2.0, gamma=3.0, kappa=0.5, invalid_penalty=5.0, epsilon=0.5, finish_scale=0.3, finish_eta =0.4,            # 奖励参数
+                 budget_factor = 0.05, wait_factor=1.25, arrival_rate = 90, privacy_rate = 0.2, job_runtime = 4, wait_policy='linearCost'):  # 自变量
+        """
+        基于PyTorch的任务调度环境
+        
+        参数:
+            total_jobs: 所有待调度的任务列表
+            num_nodes: 服务器节点数量
+            num_gpus_per_node: 每个节点的GPU数量
+            cloud_cost_weight: 云成本的权重系数
+        """
+        super().__init__()
+        # 动作空间定义 (一个优先级分数，用于排序任务)
+        self.action_space = spaces.Box(
+            low=0, high=1, 
+            shape=(max_jobs_per_ts,),  # 每个任务一个优先级分数
+            dtype=np.float32
+        )
+         # 环境参数
+        self.num_nodes = num_nodes
+        self.num_gpus_per_node = num_gpus_per_node
+        self.cloud_cost_weight = cloud_cost_weight
+        self.total_jobs = []
+
+        self.max_jobs_per_ts = max_jobs_per_ts  # 每个时隙最大的调度任务数量（包括新到来的和队列中等待的）
+        # 二维矩阵，gpu_left[n, k] = x，代表第n台服务器上的第k块GPU还有x小时释放，x=0则说明空闲
+        self.gpu_left = np.zeros((self.num_nodes, self.num_gpus_per_node), dtype=np.float32)
+        
+        # 状态空间定义
+        self.observation_space = spaces.Dict({
+            # 可变长度的任务特征矩阵 (3维特征)
+            'jobs': spaces.Box(
+                low=-np.inf, 
+                high=np.inf,
+                shape=(max_jobs_per_ts, 3),
+                dtype=np.float32
+            ),
+            # 集群状态 (每个节点的可用GPU数)
+            'cluster': spaces.Box(
+                low=0,
+                high=num_gpus_per_node,
+                shape=(num_nodes,),
+                dtype=np.int32
+            ),
+            # GPU占用情况
+            'gpu_left': spaces.Box(
+                low=0.0,
+                high=np.finfo(np.float32).max,
+                shape=(num_nodes, num_gpus_per_node),
+                dtype=np.float32
+            )
+        })
+        
+       
+
+
+        # 任务队列管理
+        self.queue = []           # 等待调度的任务队列
+        self.active_jobs = []     # 正在运行的任务
+        self.finished_jobs = []   # 已完成的任务
+        self.current_time = 0    # 当前模拟时间
+        
+        self.reward = 0.0         # 当前步的奖励值
+        self.visible_jobs = []   # 当前时隙内可调度的任务
+        self.wait_jobs = []     # 存储当前时隙动作为等待的任务
+        self.wait_factor = wait_factor
+        
+        # 统计数据
+        self.process_time = []
+        self.total_process_time = 0.0  # 累计处理时间
+        self.wait_time = []
+        self.total_wait_time = 0.0  # 累计等待时间
+        self.jct = []
+        self.cloud_cost = []
+        self.total_cloud_cost = 0.0  # 累计云成本
+        self._last_cloud_snapshot = 0.0  # 上一时隙时的累计云成本
+
+        # 奖励系数
+        self.alpha = alpha  # 任务量系数
+        self.beta = beta  # 成本系数
+        self.gamma = gamma  # 上云被拒绝系数
+        self.kappa = kappa  # 任务在本地完成的奖励
+        self.invalid_penalty = invalid_penalty  # 选到无效值的惩罚
+        self.epsilon = epsilon
+        self.finish_scale = finish_scale
+        self.finish_eta = finish_eta  # 对累加时的任务量取根号
+
+        # 成本预算
+        self.budget_cap = 0.0
+        self.budget_remain = 0.0
+        self.block_happend = False
+        self.budget_factor = budget_factor
+
+        # 自变量
+        self.arrival_rate = arrival_rate
+        self.privacy_rate = privacy_rate
+        self.job_runtime = job_runtime
+        self.wait_policy = wait_policy
+
+        # 归一化器
+        self.norm_W = EmaNormalizer(rho=0.97)
+        self.norm_C = EmaNormalizer(rho=0.97)
+
+
+        # 初始化环境状态
+        #self.reset()
+
+    def get_deadline(self, job):
+        if self.wait_policy == 'constant':
+            return 1
+        elif self.wait_policy == 'zero':
+            return 0
+        elif self.wait_policy == 'infinite':
+            return 1e12
+        elif self.wait_policy == 'linearRuntime':
+            return min(48, max(1 / 12.0, self.wait_factor * job.runtime))  # 与运行时间呈正比，不过处于5分钟~48小时之间，以防等太久
+        elif self.wait_policy == 'linearGPU':
+            return job.num_gpus * self.wait_factor
+        elif self.wait_policy == 'linearCost':
+            return job.runtime * job.num_gpus * self.wait_factor 
+           
+    
+    def _try_local_place(self, job, gpu_free):
+        """
+        尝试根据深度学习任务的放置规则在 gpu_free 上分配资源
+        ------------------------------------------------
+        参数
+        job       : Job 对象 (含 .num_gpus)
+        gpu_free  : List[int]  当前每节点空闲 GPU
+        返回
+        used_map  : {node: g_alloc}  若放置成功
+        None      : 若放置失败
+        """
+        need = job.num_gpus
+        G    = self.num_gpus_per_node        # 每节点最大 GPU (= env.num_gpus_per_node)
+        N    = self.num_nodes
+
+        if need <= G:                 # —— 单服务器任务
+            # 可装下且 free 最少的节点
+            cand = [(free, n) for n, free in enumerate(gpu_free) if free >= need]
+            if not cand:
+                return None
+            _, node = min(cand)       # best‑fit
+            return {node: need}
+
+        else:                         # —— 多服务器任务
+            remain = need
+            used   = {}
+            # 按空闲 GPU 从多到少遍历节点
+            for n in np.argsort(gpu_free)[::-1]:
+                if gpu_free[n] == 0:
+                    continue
+                alloc = min(gpu_free[n], remain)
+                used[n] = alloc
+                remain -= alloc
+                if remain == 0:
+                    break
+            return used if remain == 0 else None
+
+
+
+    def estimate_gpu_budget(self, jobs, N, G, eta=0.05):
+        """
+        对所有任务进行预估，以求得预算
+        """
+        # ------------- 预处理 -------------
+        jobs_sorted = sorted(jobs, key=lambda j: j.arrival)  # 按到达时隙
+        gpu_free_now = [G] * N        # 当前每节点空闲 GPU
+        gpu_release  = [[] for _ in range(N)]  # 节点n的释放事件列表元素为(release_slot, gpus)，即何时释放多少GPU
+        print(len(jobs_sorted))
+        for j in jobs_sorted[:5]:
+            print(j.arrival, j.deadline, j.runtime, j.num_gpus)
+
+
+        gpu_h_cloud = 0.0  # 迄今为止必须上云的任务量
+
+        # ------------- 离散事件模拟 -------------
+        for j in jobs_sorted:  # 对每个任务判断在本地最早何时能凑齐
+            t = j.timeslot             # 当前时隙
+            # ---- 更新释放队列：清掉已经早于当前时隙 t 的释放事件 ----
+            for n in range(N):
+                gpu_release[n] = [(rt, g) for (rt, g) in gpu_release[n] if rt > t]
+                gpu_free_now[n] = G - sum(g for (_, g) in gpu_release[n])  # 重新计算每个节点空闲GPU
+
+            need = j.num_gpus
+            wait_slots = 0
+            # 试图在循环内找到最早可启动时隙
+            while True:
+                # a) 当前空闲 GPU 是否够 ?
+                total_free = sum(gpu_free_now)
+                if total_free >= need:
+                    break            # 可以在 wait_slots 时隙后启动
+
+                # b) 下一个释放事件
+                earliest = min(rt for node in gpu_release for (rt, _) in node)  # 找出全集群最早的下一个释放时隙
+                # 快进到 earliest
+                for n in range(N):
+                    released = [(rt, g) for (rt, g) in gpu_release[n] if rt == earliest]
+                    gpu_free_now[n] += sum(g for (_, g) in released)
+                    gpu_release[n] = [(rt, g) for (rt, g) in gpu_release[n] if rt > earliest]
+                wait_slots = earliest - t
+
+                if wait_slots * 20/60 > j.deadline:
+                    break            # 等不到，必须上云
+
+            if wait_slots * 20/60 > j.deadline:
+                # ---- 上云，累计 GPU·h ----
+                gpu_h_cloud += j.runtime * j.num_gpus
+            else:
+                # ---- 本地排程 ----
+                placement = self._try_local_place(j, gpu_free_now)
+                if placement is None:
+                    # 前面已判定等待不会超时 ⇒ 这里理论不应失败
+                    # 为稳妥：如果失败就改判上云
+                    gpu_h_cloud += j.runtime * j.num_gpus
+                else:
+                    # 1) 立即扣减 gpu_free_now
+                    for node, alloc in placement.items():
+                        gpu_free_now[node] -= alloc
+                        # 2) 计算任务结束时隙，加入释放队列
+                        runtime_slots = math.ceil(j.runtime / (20/60.0))   # h → slot
+                        end_slot      = t + wait_slots + runtime_slots
+                        gpu_release[node].append((end_slot, alloc))
+
+                        return (1+eta) * gpu_h_cloud
+
+
+    def reset(self, seed = 2024) -> Dict[str, np.ndarray]:
+        """
+        重置环境到初始状态
+        返回初始观察值
+        """
+        """
+        # 使用Philly原始trace时，系统负载3.529
+        """
+        dataset_config = {  
+        'dataset': 'philly_gen',
+        'arrival_rate': self.arrival_rate,
+        'cv_factor': 1.0,
+        'total_jobs': 1000,
+        'seed': seed,
+        'privacy_rate': self.privacy_rate,
+        'job_runtime': self.job_runtime,
+        'max_gpus': self.num_nodes * self.num_gpus_per_node,  # 限制产生的任务最大GPU数
+        }
+        self.init_jobs = load_processed_jobs(dataset_config)
+        # 集群初始状态：每个服务器的可用GPU数
+        self.cluster_state = np.full(
+            shape=(self.num_nodes,),
+            fill_value=self.num_gpus_per_node,
+            dtype=np.int32
+        )
+
+        self.gpu_left = np.zeros((self.num_nodes, self.num_gpus_per_node), dtype=np.float32)
+        
+        budget = 0.0
+        for job in self.init_jobs:
+            if job.privacy:  # 隐私任务只能放在队列中
+                job.deadline = 1e12
+            else:    
+                job.deadline = self.get_deadline(job)
+                budget += job.cost
+        
+        #self.budget_cap = self.estimate_gpu_budget(init_jobs, self.num_nodes, self.num_gpus_per_node)
+        self.budget_cap = budget * self.budget_factor
+        self.budget_remain = self.budget_cap
+        self.block_happend = False
+
+        # 归一化器
+        self.norm_W = EmaNormalizer(rho=0.97)
+        self.norm_C = EmaNormalizer(rho=0.97)
+
+        # 任务队列管理
+        self.total_jobs = copy.deepcopy(self.init_jobs)  # 总体的任务队列
+        self.queue = []           # 等待调度的任务队列
+        self.active_jobs = []     # 正在运行的任务
+        self.finished_jobs = []   # 已完成的任务
+        self.current_time = 0    # 当前模拟时间
+        self.total_cloud_cost = 0.0  # 累计云成本
+        self.reward = 0.0         # 当前步的奖励值
+        self.visible_jobs = []   # 当前时隙内可调度的任务
+
+        self.process_time = []
+        self.total_process_time = 0.0  # 累计处理时间
+        self.wait_time = []
+        self.total_wait_time = 0.0  # 累计等待时间
+        self.jct = []  # 任务总JCT
+        self.cloud_cost = []
+        self.total_cloud_cost = 0.0  # 累计云成本
+        self._last_cloud_snapshot = 0.0
+        
+        # 加载初始任务到队列
+        self._load_jobs()
+        return self._get_observation()
+
+    
+    
+    
+    def check_waiting_status(self, job: Job):
+        """步骤2：判断任务是否等待中，且是否超过等待时间阈值"""
+        if job.waiting:
+            # 计算等待的时间是否超过上限
+            if job.waitingtime >= job.deadline:
+                # 等待时间超过阈值，进入步骤 3：判断费用上限
+                self.handle_cloud_allocation(job)
+            else:
+                # 任务还在等待，可以继续判断是否需要等待
+                self.handle_waiting_or_return(job)
+        else:
+            # 如果任务不在等待队列，进入步骤4：判断是否继续等待
+            self.handle_waiting_or_return(job)
+            
+    def handle_cloud_allocation(self, job: Job):
+        """步骤3：判断是否有足够的预算上云"""
+        if self.total_cloud_cost + job.cost <= self.budget_cap:
+            # 云费用未超过上限，选择上云
+            self.allocate_to_cloud(job)
+        else:
+            # 超过预算，放回等待队列
+            self.wait_jobs.append(job)
+            job.waiting = True
+            job.waitingtime += 20 / 60
+            if job.waitingtime < job.deadline:  # 还没到deadline，虽然在步骤4中判断已经没必要等待了，但是理论上也可以继续等下去
+                self.visible_jobs.remove(job)
+            else:  # 已经超时需要上云，但由于预算原因无法上云，此时触发block
+                self.block_happend = True
+                self.visible_jobs.remove(job)
+
+    def handle_waiting_or_return(self, job: Job):
+        """步骤4：根据预测的等待时间判断是否放回等待队列"""
+        # 预测等待时间（模拟）
+        predicted_wait_time = self.predict_waiting_time(job)
+        
+        if predicted_wait_time <= (job.deadline - job.waitingtime):
+            # 预测时间小于等于阈值，可以继续等待
+            self.wait_jobs.append(job)
+            job.waiting = True
+            job.waitingtime += 20 / 60  # 更新等待时间
+            self.visible_jobs.remove(job)
+        else:
+            # 等待时间太长，尝试上云
+            self.handle_cloud_allocation(job)
+    
+    def predict_waiting_time(self, job: Job):
+        need = job.num_gpus - sum(job.assigned_gpus)
+        if need <= self.num_gpus_per_node:
+            return self._predict_wait_single(need)  # 单服务器任务
+        else:
+            return self._predict_wait_multi(need)  # 多服务器任务
+    
+    def _predict_wait_single(self, need):
+        """
+        针对单节点任务，预测集群凑出所需GPU的最小时间
+        """
+        best = np.inf
+        for node in range(self.num_nodes):
+            free_now = self.cluster_state[node]
+            if free_now >= need:  # 本地现在就能满足的情况，理论上不会发生
+                return 0.0
+            # 还差 k 块 → 找该 node 上第 k 小释放时间
+            k = need - free_now
+            busy = self.gpu_left[node][self.gpu_left[node] > 0]
+            if len(busy) >= k:
+                t = np.partition(busy, k-1)[k-1]  # 快速找到第 k 小的元素，并保证它左边都是更小（或相等）的数，右边是更大的数，但左右两边内部不需要完全排序。
+                best = min(best, t)
+        return best
+    
+    def _predict_wait_multi(self, need):
+        """
+        针对多节点任务，预测集群凑出所需GPU的最小时间
+        """
+        if need <= np.sum(self.cluster_state):  # 现在就能满足，理论上不会发生
+            return 0.0
+        # 拉平全集群 busy GPU 剩余时间
+        all_busy = self.gpu_left[self.gpu_left > 0]  # 取出所有在忙的GPU的剩余时间，并打平成一个一维数组
+        free_now = np.sum(self.cluster_state)
+        lack = need - free_now          # 还缺多少
+        if len(all_busy) < lack:  
+            return np.inf               # 本地彻底凑不齐（整个集群都凑不出），理论上应该不会发生
+        t = np.partition(all_busy, lack-1)[lack-1]  # 找出第lack小的释放时间
+        return t
+
+    def allocate_to_cloud(self, job:Job):
+        cloud_cost = job.cost
+        self.cloud_cost.append(cloud_cost)
+        self.total_cloud_cost += cloud_cost
+        job.start = self.current_time
+        job.state = 'CLOUD'
+
+        # 记录处理的时间，在云端不考虑放置，因此使用runtime
+        self.process_time.append(job.runtime)
+        self.total_process_time += job.runtime
+
+        # 记录等待时间
+        self.wait_time.append(job.waitingtime)
+        self.total_wait_time += job.waitingtime
+        
+        jct = job.waitingtime + job.runtime
+        self.jct.append(jct)
+        
+        self.finished_jobs.append(job)
+        self.visible_jobs.remove(job)
+
+    def allocate_one_job(self, job:Job):
+        required_gpus = job.num_gpus - sum(job.assigned_gpus)
+        allocated = False
+        """
+        步骤1：检查本地资源
+        """
+        # 单服务器任务：required_gpus <= self.num_gpus_per_node
+        if required_gpus <= self.num_gpus_per_node:
+            # Best-Fit：挑空闲 GPU 最少且能装下的节点
+            cand = [(free, idx) for idx, free in enumerate(self.cluster_state)
+                     if free >= required_gpus]
+            if cand:                                     # 找得到
+                free_gpu, node = min(cand)               # 剩余最少者
+                self.cluster_state[node] -= required_gpus
+                job.assigned_gpus[node] += required_gpus
+                self._start_job_execution(job)
+                return
+        else:  # 多服务器任务
+            remaining_gpu = required_gpus
+            used_nodes = {}
+
+            # 选空闲最多的节点，逐个加直到满足需求
+            cand_nodes = _top_k_nodes_by_free(self.cluster_state, self.num_nodes)
+            for node in cand_nodes:
+                if self.cluster_state[node] > 0:
+                    used_gpus = min(self.cluster_state[node], remaining_gpu)
+                    remaining_gpu -= used_gpus
+                    used_nodes[node] = used_gpus
+                    if remaining_gpu <= 0:
+                        break
+            
+            if remaining_gpu <= 0:  # 资源已足够，开始执行
+                for node, gpus in used_nodes.items():
+                    job.assigned_gpus[node] += gpus
+                    self.cluster_state[node] -= gpus
+                self._start_job_execution(job)
+                return
+            
+        #  集群资源无法满足时
+        if job.privacy:
+            self.wait_jobs.append(job)
+            job.waiting = True
+            job.waitingtime += 20 / 60
+            self.visible_jobs.remove(job)
+        else:
+            self.check_waiting_status(job)
+
+    def _calc_remaining_gpu_hours(self) -> float:
+        """
+        GPU·min of *all* unfinished jobs
+        = (排队 + 等待 + 可见) 全量
+            + 运行中作业的剩余量
+        """
+        rem = 0.0
+        p = 1 + self.epsilon
+
+        # ① 队列中尚未启动的任务
+        for job in (self.queue + self.visible_jobs + self.wait_jobs):
+            need = job.num_gpus - sum(job.assigned_gpus)
+            rem += (job.num_gpus * job.runtime) ** p          # 仍按原始运行时计入
+
+        # ② 运行中的任务 —— 剩余 actual_time
+        #for job in self.active_jobs:
+            #rem += job.num_gpus * max(job.actual_time - job.processing_time, 0.0)
+
+        return rem          # 单位：GPU·hours
+    
+    def _calc_delta_cloud_gpu_hours(self) -> float:
+        """
+        云费的“边际增加量”，只在时隙末尾调用一次
+        """
+        delta = self.total_cloud_cost - self._last_cloud_snapshot
+        self._last_cloud_snapshot = self.total_cloud_cost
+        return delta                      # GPU·min
+
+    def step(self, action: int) -> tuple[Dict[str, np.ndarray], float, bool, dict]: 
+        """
+        执行一个动作
+        
+        参数:
+            action: 智能体给出的整数 0…max_jobs_per_ts-1
+                 - 若 idx 超出当前 visible_jobs 范围：给大惩罚，并调度 visible_jobs[0]
+                 - 否则调度 visible_jobs[idx]
+            
+        返回:
+            observation: 新的状态观察值
+            reward: 获得的奖励
+            done: 是否终止
+            info: 附加信息        
+        """
+        
+        # 加载新到达的任务到队列
+        #self._load_jobs()
+
+        reward = 0.0
+
+        # 终止条件检查
+        if self._is_done():
+            return self._get_observation(), reward, True, {}
+        
+        
+        """
+        在训练中是while 循环，在没有任务时根本不会执行到step，这种情况下如何反馈奖励
+        """
+        # 处理空队列情况，推进时隙，同步更新运行任务的情况
+        if not self.visible_jobs:
+            if action != -1:
+                reward -= self.invalid_penalty
+                return self._get_observation(), reward, False, {}
+            
+            finished_this_ts = self._update_active_jobs()   # 统计完成
+            for j in finished_this_ts:
+                if j.cost > 0:
+                    reward += self.finish_scale * (j.cost ** (-self.finish_eta))
+                else:
+                    print(f"cost:{j.cost}")
+
+            W_raw = self._calc_remaining_gpu_hours()  # 剩余任务量
+            C_raw = self._calc_delta_cloud_gpu_hours()  # 新增费用
+
+            W = self.norm_W.update(W_raw)
+            C = self.norm_C.update(C_raw)
+
+            reward -= self.alpha * W + self.beta * C
+
+            # 推进时隙，加载下一个时隙任务
+            self.current_time += 1
+            self._load_jobs()
+
+            reward = np.clip(reward, -10, 10)
+            return self._get_observation(), reward, False, {}
+        
+        
+        # -------- 判断 idx 是否有效 --------
+        if (action < 0) or (action >= len(self.visible_jobs) and len(self.visible_jobs) > 0):
+            # 事件奖励：出现无效动作，大惩罚，并按小费用优先调度首个任务
+            reward -= self.invalid_penalty
+            sorted_jobs = sorted(self.visible_jobs, key=lambda x: x.cost)
+            job_idx = self.visible_jobs.index(sorted_jobs[0])
+            current_job = self.visible_jobs[job_idx]
+        else:
+            current_job = self.visible_jobs[action]
+        
+        reward += 0.1 * math.exp(-0.05 * current_job.cost)  # 放置一个任务就给予小任务奖励
+
+        self.allocate_one_job(current_job)
+        if self.block_happend:
+            reward -= self.gamma
+            self.block_happend = False  # 惩罚一次后就恢复，不然会重复惩罚
+
+        if not self.visible_jobs:  # 如果分配完任务visible_jobs为空，则说明刚好分配完了最后一个任务，这时需要计算时隙奖励
+            finished_this_ts = self._update_active_jobs()   # 统计完成
+            for j in finished_this_ts:
+                if j.cost > 0:
+                    reward += self.finish_scale * (j.cost ** (-self.finish_eta))
+                else:
+                    print(f"cost:{j.cost}")
+
+            
+            W_raw = self._calc_remaining_gpu_hours()  # 剩余任务量
+            C_raw = self._calc_delta_cloud_gpu_hours()  # 新增费用
+
+            W = self.norm_W.update(W_raw)
+            C = self.norm_C.update(C_raw)
+
+            reward -= self.alpha * W + self.beta * C
+
+            # 推进时隙，加载下一个时隙任务，以及更新运行中的任务情况都必须在一起
+            self.current_time += 1
+            self._load_jobs()
+        
+        
+        # 检查终止条件
+        if (reward > 10) or (reward < -10):
+            print(f"reward:{reward}" )
+
+        reward = np.clip(reward, -10, 10)
+        done = self._is_done()
+        return self._get_observation(), reward, done, {}
+
+    def _load_jobs(self):
+        """将到达当前时间的任务加载到队列"""
+        for job in list(self.total_jobs):  # 遍历副本防止修改原列表
+            if job.timeslot <= self.current_time:
+                job.assigned_gpus = [0] * self.num_nodes
+                self.queue.append(job)
+                self.total_jobs.remove(job)
+            else:
+                break
+
+        """
+        把queue中的前max_jobs_per_ts个任务出队加入visible_jobs，如果当前队列queue中的任务数量<max_jobs_per_ts，以queue为准
+        """
+        # 计算实际出队任务数
+        num_to_load = max(min(self.max_jobs_per_ts - len(self.visible_jobs), len(self.queue)), 0) 
+        # 在添加任务到可见任务队列时，需要限制visible_jobs大小最大为max_jobs_per_ts，防止下一个时隙的任务加入后超出长度
+        for _ in range(num_to_load):
+            tmp_job = self.queue.pop(0)
+            # 将前num_to_load个任务出队并赋值给visible_jobs
+            self.visible_jobs.append(tmp_job)
+        
+        # 把留在queue中的任务开始计算等待
+        if self.queue:
+            for job in self.queue:
+                self.wait_jobs.append(job)
+                job.waiting = True
+                job.waitingtime += 20 / 60
+                self.queue.remove(job)
+
+
+
+    def _start_job_execution(self, job: Job):
+        """本地启动任务执行"""
+        job.start = self.current_time
+        job.state = 'LOCAL'
+        job.actual_time, used_nodes_minus_1 = self._get_actual_time(job)
+        for node_id, g in enumerate(job.assigned_gpus):
+            if g > 0:
+                # 找该 node 上还空着的 gpu idx
+                free_slots = np.where(self.gpu_left[node_id] == 0)[0][:g]
+                # 填上 remaining time
+                self.gpu_left[node_id, free_slots] = job.actual_time
+
+        # 记录处理的时间（计算+通信延迟）
+        self.process_time.append(job.actual_time)
+        self.total_process_time += job.actual_time
+
+        # 记录等待时间
+        self.wait_time.append(job.waitingtime)
+        self.total_wait_time += job.waitingtime
+
+        jct = job.actual_time+job.waitingtime
+        self.jct.append(jct)
+
+        self.active_jobs.append(job)
+        self.visible_jobs.remove(job)
+
+    def _get_actual_time(self, job: Job, inter_nodes_factor=0.1) -> float:
+        """计算考虑跨节点惩罚的实际运行时间"""
+        used_nodes = sum(gpu > 0 for gpu in job.assigned_gpus)
+        if used_nodes == 1:
+            return job.runtime, 0
+        return job.runtime * (1 + inter_nodes_factor * (used_nodes - 1)), used_nodes - 1
+
+    def _update_active_jobs(self):
+        """时隙结束，更新运行中的任务状态，返回完成的任务数"""
+        # 把 wait_jobs 的全部元素搬到 queue 前端
+        if self.wait_jobs:
+            self.queue[0:0] = self.wait_jobs     # 等价于 queue = wait_jobs + queue
+
+            # 或者：for job in self.wait_jobs[::-1]: self.queue.insert(0, job)
+
+            # 清空 wait_jobs
+            self.wait_jobs.clear()
+
+        remaining = []
+        finished_job_this_ts = []  #记录本时隙完成任务
+
+        self.gpu_left = np.maximum(0, self.gpu_left - 20 / 60)  # 更新GPU的占用矩阵
+
+        for job in self.active_jobs:
+            job.processing_time += 20 / 60  # 模拟时间推进20分钟
+
+            if job.processing_time >= job.actual_time:  # 任务完成
+                # 释放GPU资源
+                for node_id, gpus in enumerate(job.assigned_gpus):
+                    self.cluster_state[node_id] += gpus
+                self.finished_jobs.append(job)
+                finished_job_this_ts.append(job)                 
+            else:
+                remaining.append(job)
+        self.active_jobs = remaining
+        return finished_job_this_ts
+
+    def _get_observation(self) -> Dict[str, Any]:
+        """构建观察值字典"""
+               
+        job_features = []
+        for job in self.visible_jobs:
+            feat = [
+                job.runtime,
+                job.num_gpus - sum(job.assigned_gpus),
+                job.cost
+            ]
+            job_features.append(feat)
+        
+        padding = [[0.0]*3 for _ in range(self.max_jobs_per_ts - len(self.visible_jobs))]
+        job_features += padding
+
+        return {
+            'jobs': np.array(job_features, dtype=np.float32),  # 为啥一定要np.array？？
+            'cluster': self.cluster_state.copy(),
+            'gpu_left': self.gpu_left.copy(),
+        }
+
+    def _is_done(self) -> bool:
+        """判断是否终止"""
+        done = (not self.total_jobs and not self.queue and not self.active_jobs and not self.wait_jobs) and (len(self.finished_jobs) == len(self.init_jobs))
+
+        if done:
+            print(f"\n=== Episode Completed! Finished jobs: {len(self.finished_jobs)} ===")
+
+        return done
+    
+    
+    def get_time_statistics(self):
+        jct_mean = np.mean(self.jct)
+        jct_p95 = np.percentile(self.jct, 95)
+        jct_p99 = np.percentile(self.jct, 99)
+        wait_time_mean = np.mean(self.wait_time)
+        wait_time_p95 = np.percentile(self.wait_time, 95)
+        wait_time_p99 = np.percentile(self.wait_time, 99)
+
+        return jct_mean, jct_p95, jct_p99, wait_time_mean, wait_time_p95, wait_time_p99
+    
+    def get_cost_statistics(self):
+        if len(self.cloud_cost) > 0:  
+            cloud_cost_mean = np.mean(self.cloud_cost)
+            cloud_cost_p95 = np.percentile(self.cloud_cost, 95)
+            cloud_cost_p99 = np.percentile(self.cloud_cost, 99)
+        else:
+            # 如果 cloud_cost 为空，说明没有任务上传到云端，费用为0
+            cloud_cost_mean = cloud_cost_p95 = cloud_cost_p99 = 0
+        
+        return cloud_cost_mean, cloud_cost_p95, cloud_cost_p99, self.total_cloud_cost, self.budget_cap
+
+    def render(self, mode='human'):
+        """可选：实现环境可视化"""
+        print(f"Time: {self.current_time}")
+        print(f"Cluster State: {self.cluster_state}")
+        print(f"Queue Length: {len(self.queue)}")
+        print(f"Visible Jobs: {len(self.visible_jobs)}")
+        print(f"Active Jobs: {len(self.active_jobs)}")
+        print(f"Finished Jobs: {len(self.finished_jobs)}")
